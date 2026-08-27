@@ -111,19 +111,70 @@ export const neoPos = (o: Neo, tMs: number): Vec =>
   kepler(o.a, o.e, o.i, o.om, o.w, o.ma * RAD + neoMeanMotion(o) * (jd(tMs) - o.epoch));
 
 /* ── planets ────────────────────────────────────────────────────
-   Circular orbits from mean longitudes at J2000. Good to about a degree,
-   which is a pixel or two at every scale drawn here. Labelled MEAN ELEMENTS
-   in the provenance panel rather than passed off as an ephemeris. */
-export const PLANETS = [
-  { n: 'MERCURY', a: 0.38710,  L0: 252.25084, dL: 4.09233445 },
-  { n: 'VENUS',   a: 0.72333,  L0: 181.97973, dL: 1.60213034 },
-  { n: 'EARTH',   a: 1.00000,  L0: 100.46435, dL: 0.98560912 },
-  { n: 'MARS',    a: 1.52368,  L0: 355.45332, dL: 0.52403304 },
-  { n: 'JUPITER', a: 5.20260,  L0: 34.40438,  dL: 0.08308676 },
-  { n: 'SATURN',  a: 9.55491,  L0: 49.94432,  dL: 0.03344414 },
-  { n: 'URANUS',  a: 19.21845, L0: 313.23218, dL: 0.01172834 },
-  { n: 'NEPTUNE', a: 30.11039, L0: 304.88003, dL: 0.00598103 },
-] as const;
+   JPL's "Approximate Positions of the Planets": Keplerian elements at
+   J2000 plus per-century rates, good to arcminutes over 1800–2050.
+   Replaces the circular mean-longitude fudge that was here before, so
+   real eccentricity now shows — Mars visibly off-centre, Neptune's
+   orbit no longer a perfect ring.
+   Columns: a(AU), e, I(deg), L(deg), longPeri(deg), longNode(deg),
+   each with its rate per Julian century. */
+type PlanElem = readonly [number, number];
+export type Planet = {
+  n: string;
+  a: PlanElem; e: PlanElem; I: PlanElem; L: PlanElem; peri: PlanElem; node: PlanElem;
+};
+
+export const PLANETS: Planet[] = [
+  { n: 'MERCURY',
+    a: [0.38709927, 0.00000037], e: [0.20563593, 0.00001906], I: [7.00497902, -0.00594749],
+    L: [252.25032350, 149472.67411175], peri: [77.45779628, 0.16047689], node: [48.33076593, -0.12534081] },
+  { n: 'VENUS',
+    a: [0.72333566, 0.00000390], e: [0.00677672, -0.00004107], I: [3.39467605, -0.00078890],
+    L: [181.97909950, 58517.81538729], peri: [131.60246718, 0.00268329], node: [76.67984255, -0.27769418] },
+  { n: 'EARTH',
+    a: [1.00000261, 0.00000562], e: [0.01671123, -0.00004392], I: [-0.00001531, -0.01294668],
+    L: [100.46457166, 35999.37244981], peri: [102.93768193, 0.32327364], node: [0, 0] },
+  { n: 'MARS',
+    a: [1.52371034, 0.00001847], e: [0.09339410, 0.00007882], I: [1.84969142, -0.00813131],
+    L: [-4.55343205, 19140.30268499], peri: [-23.94362959, 0.44441088], node: [49.55953891, -0.29257343] },
+  { n: 'JUPITER',
+    a: [5.20288700, -0.00011607], e: [0.04838624, -0.00013253], I: [1.30439695, -0.00183714],
+    L: [34.39644051, 3034.74612775], peri: [14.72847983, 0.21252668], node: [100.47390909, 0.20469106] },
+  { n: 'SATURN',
+    a: [9.53667594, -0.00125060], e: [0.05386179, -0.00050991], I: [2.48599187, 0.00193609],
+    L: [49.95424423, 1222.49362201], peri: [92.59887831, -0.41897216], node: [113.66242448, -0.28867794] },
+  { n: 'URANUS',
+    a: [19.18916464, -0.00196176], e: [0.04725744, -0.00004397], I: [0.77263783, -0.00242939],
+    L: [313.23810451, 428.48202785], peri: [170.95427630, 0.40805281], node: [74.01692503, 0.04240589] },
+  { n: 'NEPTUNE',
+    a: [30.06992276, 0.00026291], e: [0.00859048, 0.00005105], I: [1.77004347, 0.00035372],
+    L: [-55.12002969, 218.45945325], peri: [44.96476227, -0.32241464], node: [131.78422574, -0.00508664] },
+];
+
+const wrap180 = (d: number) => { const x = ((d % 360) + 360) % 360; return x > 180 ? x - 360 : x; };
+
+/** Elements of a planet at an instant, plus the derived argument and anomaly. */
+export function planElements(p: Planet, tMs: number) {
+  const T = (jd(tMs) - 2451545.0) / 36525;
+  const at = (v: PlanElem) => v[0] + v[1] * T;
+  const a = at(p.a), e = at(p.e), I = at(p.I);
+  const node = at(p.node);
+  const w = at(p.peri) - node;                 // argument of perihelion
+  const M = wrap180(at(p.L) - at(p.peri));     // mean anomaly
+  return { a, e, I, node, w, M, periodYr: Math.pow(a, 1.5) };
+}
+
+export const planPos = (p: Planet, tMs: number): Vec => {
+  const el = planElements(p, tMs);
+  return kepler(el.a, el.e, el.I, el.node, el.w, el.M * RAD);
+};
+
+/** One full orbit as a point list, at the epoch's elements. */
+export function planOrbit(p: Planet, tMs: number, steps = 96): Vec[] {
+  const el = planElements(p, tMs);
+  return Array.from({ length: steps + 1 }, (_, k) =>
+    kepler(el.a, el.e, el.I, el.node, el.w, (k / steps) * Math.PI * 2));
+}
 
 /** Measured and modelled boundaries of the solar system, in AU. */
 export const BOUNDS = {
@@ -135,10 +186,6 @@ export const BOUNDS = {
   oortOuter: 100000,
 } as const;
 
-export const planPos = (p: (typeof PLANETS)[number], tMs: number): Vec => {
-  const th = (p.L0 + p.dL * (jd(tMs) - 2451545.0)) * RAD;
-  return [p.a * Math.cos(th), p.a * Math.sin(th), 0];
-};
 export const earthAU = (tMs: number) => planPos(PLANETS[2], tMs);
 export const INNER = 4;   // planets 0..3 are the inner system
 export const sunDir = (tMs: number): Vec => {

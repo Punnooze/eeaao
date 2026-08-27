@@ -1,7 +1,7 @@
 import { cdToMs } from './astro';
-import { NotModifiedError, remember } from './cache';
+import { NotModifiedError, recall, remember } from './cache';
 import type {
-  Flight, Neo, NeoApproach, Quake, SatGroup, SatTle, SatTotals, Snapshot, SpaceWeather,
+  Flight, Neo, NeoApproach, Quake, SatGroup, SatTle, SatTotals, Snapshot, SpaceWeather, System, Tno, Exoplanet,
 } from './types';
 
 /**
@@ -22,10 +22,34 @@ export const TTL = {
   sbdb: 604800,
   tle: 10800,
   seismic: 300,
-  traffic: 60,
+  traffic: 180,
+  route: 604800,      // a scheduled route does not change week to week
+  tno: 604800,
+  systems: 604800,
 } as const;
 
 const UA = 'four-regimes/0.1 (personal project; public data only)';
+
+/**
+ * Bounded-concurrency map with a small stagger. adsb.lol drops most of a
+ * fifteen-way parallel burst — the first attempt got 3 of 15 corridors back —
+ * so requests go out a few at a time. Cached hubs resolve instantly, which
+ * makes this cheap once warm.
+ */
+async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  const out: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      try { out[i] = { status: 'fulfilled', value: await fn(items[i]) }; }
+      catch (reason) { out[i] = { status: 'rejected', reason }; }
+      await new Promise(r => setTimeout(r, 700));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
 
 async function get(url: string, revalidate: number) {
   const r = await fetch(url, {
@@ -176,6 +200,110 @@ export async function getNeo(): Promise<{ neo: Neo[]; neoTab: NeoApproach[]; neo
   return { neo, neoTab, neoTotal: +cad.count };
 }
 
+/* ═══ trans-neptunian objects ════════════════════════════════════
+   The Kuiper belt used to be a random point cloud, which meant the dots
+   were unclickable on principle — they were not anything. These are real
+   bodies with published elements, so they can be selected and read. */
+export async function getTnos(): Promise<Tno[]> {
+  const fields = 'full_name,a,e,i,om,w,ma,epoch,H,class';
+  const cdata = encodeURIComponent(JSON.stringify({ AND: ['H|LT|7'] }));
+  const d = await bigJson<{ fields: string[]; data: string[][] }>(
+    `${JPL}/sbdb_query.api?fields=${fields}&sb-class=TNO&sb-cdata=${cdata}&limit=90`, TTL.tno);
+  const idx = Object.fromEntries(d.fields.map((f, i) => [f, i]));
+  const num = (v: string) => Number(v);
+  return d.data
+    .map(r => ({
+      name: r[idx.full_name].trim().replace(/\s+/g, ' '),
+      a: num(r[idx.a]), e: num(r[idx.e]), i: num(r[idx.i]),
+      om: num(r[idx.om]), w: num(r[idx.w]), ma: num(r[idx.ma]),
+      epoch: num(r[idx.epoch]), h: num(r[idx.H]), cls: r[idx.class] ?? 'TNO',
+    }))
+    .filter(o => [o.a, o.e, o.i, o.om, o.w, o.ma, o.epoch].every(Number.isFinite) && o.a > 20)
+    .sort((x, y) => x.a - y.a)
+    .slice(0, 70);
+}
+
+/* ═══ planetary systems ══════════════════════════════════════════
+   NASA's Exoplanet Archive, keyless. CSV rather than JSON: the JSON
+   serialiser on their TAP endpoint took 90 s and truncated, while the same
+   query as CSV returns in under four seconds.
+
+   Positions come from the archive's own ra/dec/distance rather than by
+   name-matching against HYG, which would be fuzzy and would fail exactly on
+   the interesting cases (Proxima Cen vs Proxima Centauri, GJ vs Gliese).
+*/
+const EXO = 'https://exoplanetarchive.ipac.caltech.edu/TAP/sync';
+const EXO_MAX_PC = 31;
+
+function csv(text: string): Record<string, string>[] {
+  const lines = text.split('\n').filter(l => l.trim().length > 0);
+  if (!lines.length) return [];
+  const cell = (line: string) => {
+    const out: string[] = [];
+    let cur = '', q = false;
+    for (const ch of line) {
+      if (ch === '"') q = !q;
+      else if (ch === ',' && !q) { out.push(cur); cur = ''; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  };
+  const head = cell(lines[0]);
+  return lines.slice(1).map(l => Object.fromEntries(cell(l).map((v, i) => [head[i], v])));
+}
+
+export async function getSystems(): Promise<System[]> {
+  const cols = 'hostname,pl_name,sy_dist,sy_pnum,ra,dec,pl_orbsmax,pl_orbper,pl_rade,'
+    + 'pl_bmasse,pl_eqt,st_spectype,st_teff,st_rad,st_mass,discoverymethod,disc_year';
+  const q = `select+${cols}+from+pscomppars+where+sy_dist+<+${EXO_MAX_PC}`;
+  const raw = await remember<string>(`exo:${EXO_MAX_PC}`, TTL.systems, async () => {
+    const r = await fetch(`${EXO}?query=${q}&format=csv`, {
+      next: { revalidate: TTL.systems }, headers: { 'user-agent': UA },
+    });
+    if (!r.ok) throw new Error(`exoplanet archive → ${r.status}`);
+    return r.text();
+  });
+
+  const num = (v: string | undefined) => {
+    const n = Number(v);
+    return v && v.trim() && Number.isFinite(n) ? n : null;
+  };
+  const byHost = new Map<string, System>();
+  for (const row of csv(raw)) {
+    const host = row.hostname?.trim();
+    const dist = num(row.sy_dist);
+    const ra = num(row.ra), dec = num(row.dec);
+    if (!host || dist == null || ra == null || dec == null) continue;
+
+    let sys = byHost.get(host);
+    if (!sys) {
+      const la = dec * Math.PI / 180, lo = ra * Math.PI / 180;
+      sys = {
+        host, dist, ra, dec,
+        x: +(dist * Math.cos(la) * Math.cos(lo)).toFixed(4),
+        y: +(dist * Math.cos(la) * Math.sin(lo)).toFixed(4),
+        z: +(dist * Math.sin(la)).toFixed(4),
+        spect: row.st_spectype?.trim() || '—',
+        teff: num(row.st_teff), srad: num(row.st_rad), smass: num(row.st_mass),
+        planets: [],
+      };
+      byHost.set(host, sys);
+    }
+    const pl: Exoplanet = {
+      name: (row.pl_name || '').trim(),
+      a: num(row.pl_orbsmax), period: num(row.pl_orbper),
+      rade: num(row.pl_rade), masse: num(row.pl_bmasse), eqt: num(row.pl_eqt),
+      method: row.discoverymethod?.trim() || '—', year: num(row.disc_year),
+    };
+    if (pl.name) sys.planets.push(pl);
+  }
+  for (const s of byHost.values()) {
+    s.planets.sort((a, b) => (a.a ?? 9e9) - (b.a ?? 9e9));
+  }
+  return [...byHost.values()].sort((a, b) => a.dist - b.dist);
+}
+
 /* ═══ satellites ═════════════════════════════════════════════════ */
 const CELESTRAK = 'https://celestrak.org/NORAD/elements/gp.php';
 /** group → [CelesTrak group, sample stride, cap]. Sampling keeps the client
@@ -256,29 +384,128 @@ export async function getSeismic(): Promise<{ eq: Quake[]; eqTotal: number; eqTi
   return { eq: eq.slice(0, 70), eqTotal: eq.length, eqTitle: f.metadata.title };
 }
 
-/* ═══ air traffic ════════════════════════════════════════════════ */
-export const OBSERVER = { lat: 12.97, lon: 77.59, name: 'BLR', radiusNm: 250 };
+/* ═══ air traffic ════════════════════════════════════════════════
+   There is no free feed of every aircraft on Earth. OpenSky's global
+   /states/all is unreachable from here and adsb.lol's /v2/all answers 503,
+   so the honest approach is to sample: 250 nm circles over the busiest
+   international corridors, deduplicated by ICAO hex. That covers where
+   long-haul traffic actually is, and the UI says "sampled", not "all".
+
+   "International" is then a real determination, not a guess — adsbdb maps
+   callsign to origin and destination airports with country codes, so a
+   crossing is confirmed when the two countries differ. Routes are cached
+   for a week because a scheduled route does not move.
+*/
+const HUBS: [string, number, number][] = [
+  ['LHR', 51.47, -0.46], ['CDG', 49.01, 2.55], ['FRA', 50.03, 8.56],
+  ['IST', 41.28, 28.75], ['DXB', 25.25, 55.36], ['DEL', 28.56, 77.10],
+  ['BLR', 12.97, 77.59], ['SIN', 1.36, 103.99], ['HKG', 22.31, 113.91],
+  ['NRT', 35.77, 140.39], ['SYD', -33.94, 151.18], ['LAX', 33.94, -118.41],
+  ['JFK', 40.64, -73.78], ['GRU', -23.43, -46.47], ['JNB', -26.14, 28.25],
+];
+
+/** Cruise filter: a long-haul aircraft in the air, not a circuit or a taxi. */
+const CRUISE_FT = 28000;
+const CRUISE_KT = 350;
+/** NEW route lookups per refresh. Cached routes are applied for free. */
+const ENRICH_PER_CALL = 40;
 
 type AdsbAc = {
-  lat?: number; lon?: number; track?: number; calc_track?: number;
+  hex?: string; lat?: number; lon?: number; track?: number; calc_track?: number;
   alt_baro?: number | 'ground'; flight?: string; r?: string; t?: string; gs?: number;
 };
 
-export async function getTraffic(): Promise<{ fl: Flight[]; flTotal: number }> {
-  const d = await json<{ ac?: AdsbAc[] }>(
-    `https://api.adsb.lol/v2/point/${OBSERVER.lat}/${OBSERVER.lon}/${OBSERVER.radiusNm}`, TTL.traffic);
-  const fl: Flight[] = (d.ac ?? [])
-    .filter(a => a.lat != null && a.lon != null)
-    .map(a => ({
-      lat: +a.lat!.toFixed(3), lon: +a.lon!.toFixed(3),
-      trk: Math.round(a.track ?? a.calc_track ?? 0),
-      alt: a.alt_baro === 'ground' ? 0 : Math.round(a.alt_baro ?? 0),
-      flight: (a.flight ?? a.r ?? '——').trim(),
-      type: a.t ?? '—',
-      gs: Math.round(a.gs ?? 0),
-    }))
-    .sort((a, b) => b.alt - a.alt);
-  return { fl: fl.slice(0, 64), flTotal: fl.length };
+type RouteInfo = {
+  orig?: string; dest?: string;
+  origCountry?: string; destCountry?: string;
+  origLat?: number; origLon?: number; destLat?: number; destLon?: number;
+  airline?: string;
+};
+
+async function lookupRoute(callsign: string): Promise<RouteInfo | null> {
+  return remember<RouteInfo | null>(`route:${callsign}`, TTL.route, async () => {
+    const r = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`, {
+      next: { revalidate: TTL.route }, headers: { 'user-agent': UA },
+    });
+    if (r.status === 404) return null;              // unknown callsign is a fact, cache it
+    if (!r.ok) throw new Error(`adsbdb → ${r.status}`);
+    const j = await r.json() as {
+      response?: { flightroute?: {
+        origin?: { iata_code?: string; country_iso_name?: string; latitude?: number; longitude?: number };
+        destination?: { iata_code?: string; country_iso_name?: string; latitude?: number; longitude?: number };
+        airline?: { name?: string };
+      } };
+    };
+    const fr = j.response?.flightroute;
+    if (!fr?.origin || !fr?.destination) return null;
+    return {
+      orig: fr.origin.iata_code, dest: fr.destination.iata_code,
+      origCountry: fr.origin.country_iso_name, destCountry: fr.destination.country_iso_name,
+      origLat: fr.origin.latitude, origLon: fr.origin.longitude,
+      destLat: fr.destination.latitude, destLon: fr.destination.longitude,
+      airline: fr.airline?.name,
+    };
+  });
+}
+
+export async function getTraffic(): Promise<{
+  fl: Flight[]; flTotal: number; flIntl: number; flSeen: number; flHubs: number;
+}> {
+  // adsb.lol answers 429 above roughly one request per second, so corridors go
+  // out two at a time with a stagger, and each one lands in the disk cache.
+  // A rate-limited corridor then serves its last good copy instead of vanishing.
+  const circles = await pool(HUBS, 2, ([, lat, lon]) =>
+    bigJson<{ ac?: AdsbAc[] }>(`https://api.adsb.lol/v2/point/${lat}/${lon}/250`, TTL.traffic));
+
+  const byHex = new Map<string, Flight>();
+  let seen = 0;
+  let hubs = 0;
+  for (const c of circles) {
+    if (c.status !== 'fulfilled') continue;
+    hubs++;
+    for (const a of c.value.ac ?? []) {
+      if (a.lat == null || a.lon == null || !a.hex) continue;
+      seen++;
+      const alt = a.alt_baro === 'ground' ? 0 : Math.round(a.alt_baro ?? 0);
+      const gs = Math.round(a.gs ?? 0);
+      if (alt < CRUISE_FT || gs < CRUISE_KT) continue;      // cruise only
+      const flight = (a.flight ?? a.r ?? '').trim();
+      if (!flight) continue;
+      byHex.set(a.hex, {
+        hex: a.hex,
+        lat: +a.lat.toFixed(3), lon: +a.lon.toFixed(3),
+        trk: Math.round(a.track ?? a.calc_track ?? 0),
+        alt, gs, flight, type: a.t ?? '—',
+      });
+    }
+  }
+
+  const all = [...byHex.values()].sort((x, y) => y.alt - x.alt);
+
+  const apply = (f: Flight, r: RouteInfo | null) => {
+    if (!r) return;
+    Object.assign(f, r);
+    if (r.origCountry && r.destCountry) f.intl = r.origCountry !== r.destCountry;
+  };
+
+  // Pass 1: everything already cached, applied for free. Without this the
+  // budget below was the only thing that ever set a route, so a week of
+  // accumulated lookups was thrown away on every refresh.
+  await Promise.all(all.map(async f => apply(f, await recall<RouteInfo | null>(`route:${f.flight}`, TTL.route))));
+
+  // Pass 2: spend the request budget only on callsigns nothing knows yet.
+  const pending = all.filter(f => f.orig === undefined).slice(0, ENRICH_PER_CALL);
+  await pool(pending, 4, async f => apply(f, await lookupRoute(f.flight).catch(() => null)));
+
+  // Confirmed crossings first — they are the ones we can actually stand behind.
+  all.sort((x, y) => Number(y.intl ?? false) - Number(x.intl ?? false) || y.alt - x.alt);
+  return {
+    fl: all.slice(0, 700),   // the globe can carry it; sparse looked broken
+    flTotal: all.length,
+    flIntl: all.filter(f => f.intl).length,
+    flSeen: seen,
+    flHubs: hubs,
+  };
 }
 
 /* ═══ assembled payload ══════════════════════════════════════════ */
@@ -294,15 +521,17 @@ const EMPTY_SW: SpaceWeather = {
  * dead panel.
  */
 export async function getSnapshot(): Promise<Snapshot> {
-  const [sw, neo, sat, eq, fl] = await Promise.allSettled([
-    getSpaceWeather(), getNeo(), getSatellites(), getSeismic(), getTraffic(),
+  const [sw, neo, sat, eq, fl, tno] = await Promise.allSettled([
+    getSpaceWeather(), getNeo(), getSatellites(), getSeismic(), getTraffic(), getTnos(),
   ]);
+  const sys = await getSystems().catch(() => [] as System[]);
   const degraded: string[] = [];
   const note = (name: string, r: PromiseSettledResult<unknown>) => {
     if (r.status === 'rejected') degraded.push(`${name}: ${String(r.reason?.message ?? r.reason)}`);
   };
   note('SPACE WEATHER', sw); note('NEO', neo); note('SATELLITES', sat);
-  note('SEISMIC', eq); note('TRAFFIC', fl);
+  note('SEISMIC', eq); note('TRAFFIC', fl); note('TNO', tno);
+  if (!sys.length) degraded.push('SYSTEMS: exoplanet archive unavailable');
   if (sat.status === 'fulfilled' && sat.value.satMissing.length) {
     degraded.push(`ELEMENT SETS STALE: ${sat.value.satMissing.join(', ')}`);
   }
@@ -314,7 +543,10 @@ export async function getSnapshot(): Promise<Snapshot> {
     ...(sat.status === 'fulfilled' ? sat.value
       : { sat: [], satTotals: { ISS: 0, GPS: 0, GEO: 0, STL: 0, OWB: 0 }, satMissing: [] }),
     ...(eq.status === 'fulfilled' ? eq.value : { eq: [], eqTotal: 0, eqTitle: 'NO DATA' }),
-    ...(fl.status === 'fulfilled' ? fl.value : { fl: [], flTotal: 0 }),
+    ...(fl.status === 'fulfilled' ? fl.value
+      : { fl: [], flTotal: 0, flIntl: 0, flSeen: 0, flHubs: 0 }),
+    tno: tno.status === 'fulfilled' ? tno.value : [],
+    sys,
     degraded,
   };
 }

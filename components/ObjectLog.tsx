@@ -1,13 +1,20 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { AU, LD, PC, PLANETS, type SatState } from '@/lib/astro';
+import { AU, LD, PC, PLANETS, planElements, type SatState } from '@/lib/astro';
 import { BOUNDS } from '@/lib/astro';
 import type { Sel } from '@/lib/draw';
 import { detailOf } from '@/lib/detail';
 import { REG } from '@/lib/regimes';
 import { STARS } from '@/lib/stars';
-import type { Snapshot } from '@/lib/types';
+import type { Snapshot, System } from '@/lib/types';
+const TONE_VAR: Record<string, string> = {
+  live: 'var(--color-live)',
+  hazard: 'var(--color-hazard)',
+  caution: 'var(--color-caution)',
+  'series-a': 'var(--color-series-a)',
+};
+
 import { Chip, Rows } from './Ui';
 
 export type SurfMode = 'eq' | 'fl';
@@ -17,7 +24,21 @@ type LogSpec = { tab: string; cols: string; head: [string, string, string]; rows
 
 const n0 = (v: number) => Math.round(v).toLocaleString('en-US');
 
-function specFor(dom: number, d: Snapshot, sats: SatState[], mode: SurfMode): LogSpec {
+function specFor(dom: number, d: Snapshot, sats: SatState[], mode: SurfMode, focus: System | null): LogSpec {
+  if (focus && dom >= 2 && dom <= 5) {
+    return {
+      tab: `${focus.host} · system`, cols: '1fr 74px 52px', head: ['Planet', 'AU', 'R⊕'],
+      rows: focus.planets.map((p, i) => ({
+        id: p.name,
+        cells: [
+          p.name.replace(focus.host, '').trim() || p.name,
+          p.a != null ? (p.a < 0.1 ? p.a.toFixed(4) : p.a.toFixed(3)) : '—',
+          p.rade != null ? p.rade.toFixed(2) : '—',
+        ] as [string, string, string],
+        sel: { kind: 'planetX', i } as Sel,
+      })),
+    };
+  }
   switch (dom) {
     case 0:
       return {
@@ -43,7 +64,20 @@ function specFor(dom: number, d: Snapshot, sats: SatState[], mode: SurfMode): Lo
           cells: [s[5] || `HYG ${i}`, `${(pc * 3.26156).toFixed(2)}`, s[3].toFixed(2)] as [string, string, string],
           sel: { kind: 'star', i } as Sel,
         }));
-      return { tab: 'Star Catalogue', cols: '1fr 54px 40px', head: ['Star', 'LY', 'Mag'], rows };
+      const systems = d.sys.map((sy, i) => ({
+        id: `sys${i}`,
+        cells: [
+          `◎ ${sy.host}`,
+          (sy.dist * 3.26156).toFixed(2),
+          `${sy.planets.length}p`,
+        ] as [string, string, string],
+        sel: { kind: 'system', i } as Sel,
+      }));
+      // Systems first: a star with known planets is the more interesting object.
+      return {
+        tab: 'Stars & Systems', cols: '1fr 54px 40px', head: ['Star', 'LY', 'Mag'],
+        rows: [...systems, ...rows],
+      };
     }
     case 2:
       return {
@@ -60,11 +94,25 @@ function specFor(dom: number, d: Snapshot, sats: SatState[], mode: SurfMode): Lo
     case 3:
       return {
         tab: 'Outer Bodies', cols: '1fr 60px 52px', head: ['Body', 'AU', 'Period'],
-        rows: PLANETS.slice(4).map((p, k) => ({
-          id: p.n,
-          cells: [p.n, p.a.toFixed(3), `${(360 / p.dL / 365.25).toFixed(1)} YR`] as [string, string, string],
-          sel: { kind: 'planet', i: k + 4 } as Sel,
-        })),
+        rows: [
+          ...PLANETS.slice(4).map((p, k) => {
+            const el = planElements(p, Date.now());
+            return {
+              id: p.n,
+              cells: [p.n, el.a.toFixed(3), `${el.periodYr.toFixed(1)} YR`] as [string, string, string],
+              sel: { kind: 'planet', i: k + 4 } as Sel,
+            };
+          }),
+          ...d.tno.map((t, i) => ({
+            id: `tno${i}`,
+            cells: [
+              t.name.replace(/^\d+\s*/, ''),
+              t.a.toFixed(1),
+              `${Math.pow(t.a, 1.5).toFixed(0)} YR`,
+            ] as [string, string, string],
+            sel: { kind: 'tno', i } as Sel,
+          })),
+        ],
       };
     case 4:
       return {
@@ -104,10 +152,14 @@ function specFor(dom: number, d: Snapshot, sats: SatState[], mode: SurfMode): Lo
           })),
         }
         : {
-          tab: 'Air Traffic', cols: '1fr 44px 44px', head: ['Callsign', 'FL', 'Type'],
+          tab: 'International Traffic', cols: '1fr 78px 40px', head: ['Callsign', 'Route', 'FL'],
           rows: d.fl.map((f, i) => ({
-            id: `${f.flight}-${i}`,
-            cells: [f.flight, String(Math.round(f.alt / 100)).padStart(3, '0'), f.type] as [string, string, string],
+            id: `${f.hex}-${i}`,
+            cells: [
+              f.flight,
+              f.orig && f.dest ? `${f.orig}→${f.dest}` : '—',
+              String(Math.round(f.alt / 100)).padStart(3, '0'),
+            ] as [string, string, string],
             sel: { kind: 'flight', i } as Sel,
           })),
         };
@@ -115,15 +167,18 @@ function specFor(dom: number, d: Snapshot, sats: SatState[], mode: SurfMode): Lo
 }
 
 export default function ObjectLog({
-  dom, data, sats, sel, simT, mode, onSelect, onMode, onClose,
+  dom, data, sats, sel, simT, mode, focus, onSelect, onMode, onClose, onFly, onReturn,
 }: {
   dom: number; data: Snapshot; sats: SatState[]; sel: Sel; simT: number;
+  focus: System | null;
   mode: SurfMode;
   onSelect: (s: Sel) => void;
   onMode: (m: SurfMode) => void;
   onClose?: () => void;
+  onFly?: (sy: System) => void;
+  onReturn?: () => void;
 }) {
-  const spec = specFor(dom, data, sats, mode);
+  const spec = specFor(dom, data, sats, mode, focus);
   const detail = detailOf(sel, data, sats, simT);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -169,9 +224,28 @@ export default function ObjectLog({
 
       {detail && (
         <div className="mb-[7px] border-y border-dotted border-y-[color-mix(in_srgb,var(--color-chrome)_30%,transparent)] py-[6px]">
-          <p className="t-data mb-[5px] text-caution">{detail.title}</p>
+          <p className="t-data text-caution">{detail.title}</p>
+          <p
+            className="mb-[6px] mt-[2px] font-ui text-[9.5px] font-semibold uppercase tracking-[0.14em]"
+            style={{ color: TONE_VAR[detail.tone] }}
+          >
+            {detail.kind}
+          </p>
           <Rows items={detail.rows} />
+          {onFly && sel?.kind === 'system' && data.sys[sel.i]
+            && data.sys[sel.i].host !== focus?.host && (
+            <button type="button" className="btn mt-[7px] w-full"
+              onClick={() => onFly(data.sys[sel.i])}>
+              Fly to {data.sys[sel.i].host}
+            </button>
+          )}
         </div>
+      )}
+
+      {focus && onReturn && (
+        <button type="button" className="btn mb-[7px] w-full" onClick={onReturn}>
+          Return to Sol
+        </button>
       )}
 
       <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">

@@ -6,10 +6,18 @@ import { detailOf } from '@/lib/detail';
 import { anchorAt, anchorLabel, drawFrame, LAND_REF, type Mark, type Sel } from '@/lib/draw';
 import { LAND } from '@/lib/land';
 import { alphaOf, DEC_PER_PX, dominant, fmtScale, LMAX, LMIN, N_REG, railFrac, REG } from '@/lib/regimes';
-import type { Snapshot } from '@/lib/types';
+import type { Snapshot, System } from '@/lib/types';
+import Brief from './Brief';
 import Docs from './Docs';
 import ObjectLog, { type SurfMode } from './ObjectLog';
 import { Rows } from './Ui';
+
+const TONE_VAR: Record<string, string> = {
+  live: 'var(--color-live)',
+  hazard: 'var(--color-hazard)',
+  caution: 'var(--color-caution)',
+  'series-a': 'var(--color-series-a)',
+};
 
 const RATES = [1, 120, 3600] as const;
 const n0 = (v: number) => Math.round(v).toLocaleString('en-US');
@@ -38,13 +46,20 @@ export default function Console({ initial }: { initial: Snapshot }) {
   const [sel, setSel] = useState<Sel>(null);
   const [mode, setMode] = useState<SurfMode>('eq');
   const [tick, setTick] = useState(initial.t);
+  const [camView, setCamView] = useState({ lat: 14, lon: 78 });
   const [rate, setRate] = useState<number>(1);
   const [held, setHeld] = useState(false);
   const [tip, setTip] = useState<{ x: number; y: number } | null>(null);
   // Overlays are opt-out, not structural: the canvas never gives up space.
   const [showLog, setShowLog] = useState(true);
   const [showDocs, setShowDocs] = useState(false);
+  const [showBrief, setShowBrief] = useState(true);
   const [bare, setBare] = useState(false);
+  const [panned, setPanned] = useState(false);
+  // Falls back to a fixed point until the visitor allows geolocation.
+  const [obs, setObs] = useState({ lat: 12.97, lon: 77.59, label: 'BLR', live: false });
+  /** A foreign star whose system replaces ours on the inner rungs. */
+  const [focus, setFocus] = useState<System | null>(null);
 
   const heroRef = useRef<HTMLDivElement>(null);
   const cvRef = useRef<HTMLCanvasElement>(null);
@@ -54,6 +69,12 @@ export default function Console({ initial }: { initial: Snapshot }) {
   const sim = useRef(initial.t);
   const wall = useRef(0);
   const marks = useRef<Mark[]>([]);
+  /** Free pan, in screen radii, so it holds its visual position across zoom. */
+  const pan = useRef({ x: 0, y: 0 });
+  const obsRef = useRef(obs);
+  obsRef.current = obs;
+  const focusRef = useRef<System | null>(null);
+  focusRef.current = focus;
   const selRef = useRef<Sel>(null);
   const rateRef = useRef(1);
   const heldRef = useRef(false);
@@ -98,6 +119,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
 
     wall.current = performance.now();
     let committed = L.current;
+    let camCommitted = { ...cam.current };
 
     const loop = () => {
       const now = performance.now();
@@ -121,12 +143,20 @@ export default function Console({ initial }: { initial: Snapshot }) {
         sats: satsRef.current,
         sel: selRef.current,
         reduced: reduced.current,
-        anchor: anchorAt(L.current, sim.current),
+        anchor: anchorAt(L.current, sim.current, focusRef.current),
+        pan: pan.current,
+        observer: obsRef.current,
+        focus: focusRef.current,
       });
 
       if (Math.abs(L.current - committed) > 1e-4) {
         committed = L.current;
         setUiL(L.current);
+      }
+      if (Math.abs(cam.current.lat - camCommitted.lat) > 0.05
+        || Math.abs(cam.current.lon - camCommitted.lon) > 0.05) {
+        camCommitted = { ...cam.current };
+        setCamView(camCommitted);
       }
       raf = requestAnimationFrame(loop);
     };
@@ -151,8 +181,40 @@ export default function Console({ initial }: { initial: Snapshot }) {
     return () => clearInterval(id);
   }, []);
 
+  /* ── where the visitor actually is ───────────────────────────── */
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        const lat = +pos.coords.latitude.toFixed(4);
+        const lon = +pos.coords.longitude.toFixed(4);
+        setObs({ lat, lon, label: 'YOU', live: true });
+        // Face the globe at them, so descending lands where they are.
+        cam.current = { lat, lon };
+      },
+      () => { /* denied or unavailable: the default observer stands */ },
+      { timeout: 8000, maximumAge: 600000 },
+    );
+  }, []);
+
   /* ── input ───────────────────────────────────────────────────── */
   const jump = useCallback((i: number) => { target.current = REG[i].L; setTip(null); }, []);
+
+  const recentre = useCallback(() => {
+    pan.current = { x: 0, y: 0 };
+    setPanned(false);
+    setTip(null);
+  }, []);
+
+  /** Put the visitor's own ground under the crosshair. */
+  const locate = useCallback(() => {
+    const o = obsRef.current;
+    cam.current = { lat: o.lat, lon: o.lon };
+    pan.current = { x: 0, y: 0 };
+    setPanned(false);
+    target.current = REG[REG.length - 1].L;
+    setTip(null);
+  }, []);
 
   useEffect(() => {
     const hero = heroRef.current;
@@ -169,20 +231,32 @@ export default function Console({ initial }: { initial: Snapshot }) {
     };
     hero.addEventListener('wheel', onWheel, { passive: false });
 
-    let drag: { x: number; y: number; id: number } | null = null;
+    // Two gestures on one surface: plain drag flies the plane, a modified
+    // drag orbits the camera. Both were wanted; a mode switch would have
+    // meant reaching for a control mid-flight.
+    let drag: { x: number; y: number; id: number; orbit: boolean } | null = null;
     let moved = 0;
+    const isOrbit = (e: PointerEvent) => e.shiftKey || e.ctrlKey || e.altKey || e.button === 2;
     const down = (e: PointerEvent) => {
       if ((e.target as HTMLElement).closest('[data-ladder]')) return;
-      drag = { x: e.clientX, y: e.clientY, id: e.pointerId };
+      drag = { x: e.clientX, y: e.clientY, id: e.pointerId, orbit: isOrbit(e) };
       moved = 0;
+      hero.style.cursor = drag.orbit ? 'grabbing' : 'move';
       hero.setPointerCapture(e.pointerId);
     };
     const move = (e: PointerEvent) => {
       if (!drag || e.pointerId !== drag.id) return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
       moved += Math.abs(dx) + Math.abs(dy);
-      cam.current.lon -= dx * 0.32;
-      cam.current.lat = clamp(cam.current.lat + dy * 0.28, -88, 88);
+      if (drag.orbit) {
+        cam.current.lon -= dx * 0.32;
+        cam.current.lat = clamp(cam.current.lat + dy * 0.28, -88, 88);
+      } else {
+        const R = Math.min(size.current.w, size.current.h) * 0.46 || 1;
+        pan.current.x += dx / R;
+        pan.current.y += dy / R;
+        if (moved > 6) setPanned(true);
+      }
       drag.x = e.clientX; drag.y = e.clientY;
       if (moved > 6) setTip(null);
     };
@@ -199,28 +273,34 @@ export default function Console({ initial }: { initial: Snapshot }) {
         else { setSel(null); setTip(null); }
       }
       drag = null;
+      hero.style.cursor = 'grab';
     };
+    hero.addEventListener('contextmenu', (e: Event) => e.preventDefault());
     hero.addEventListener('pointerdown', down);
     hero.addEventListener('pointermove', move);
     hero.addEventListener('pointerup', up);
     hero.addEventListener('pointercancel', () => { drag = null; });
 
+    // One finger pans (handled by the pointer events above); two fingers
+    // pinch to zoom and twist to orbit.
     let pinch = 0;
+    let twist = 0;
+    const gap = (e: TouchEvent) => Math.hypot(
+      e.touches[0].clientX - e.touches[1].clientX,
+      e.touches[0].clientY - e.touches[1].clientY);
+    const angleOf = (e: TouchEvent) => Math.atan2(
+      e.touches[1].clientY - e.touches[0].clientY,
+      e.touches[1].clientX - e.touches[0].clientX);
     const ts = (e: TouchEvent) => {
-      if (e.touches.length === 2) {
-        pinch = Math.hypot(
-          e.touches[0].clientX - e.touches[1].clientX,
-          e.touches[0].clientY - e.touches[1].clientY);
-      }
+      if (e.touches.length === 2) { pinch = gap(e); twist = angleOf(e); }
     };
     const tm = (e: TouchEvent) => {
       if (e.touches.length !== 2 || !pinch) return;
-      const d = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY);
+      const d = gap(e), th = angleOf(e);
       target.current = null;
       L.current = clamp(L.current - Math.log10(d / pinch) * 1.4, LMIN, LMAX);
-      pinch = d;
+      cam.current.lon -= ((th - twist) * 180) / Math.PI;
+      pinch = d; twist = th;
       setUiL(L.current);
     };
     hero.addEventListener('touchstart', ts, { passive: true });
@@ -240,6 +320,9 @@ export default function Console({ initial }: { initial: Snapshot }) {
       if (e.key === 'l') setShowLog(v => !v);
       if (e.key === 'r') setShowDocs(v => !v);
       if (e.key === 'h') setBare(v => !v);
+      if (e.key === 'b') setShowBrief(v => !v);
+      if (e.key === 'c') recentre();
+      if (e.key === 'g') locate();
     };
     addEventListener('keydown', key);
 
@@ -252,13 +335,34 @@ export default function Console({ initial }: { initial: Snapshot }) {
       hero.removeEventListener('touchmove', tm);
       removeEventListener('keydown', key);
     };
-  }, [jump]);
+  }, [jump, recentre, locate]);
 
   /* ── readouts ────────────────────────────────────────────────── */
   const hw = Math.pow(10, uiL);
-  const detail = detailOf(sel, data, sats, tick);
+  const detail = detailOf(sel, data, sats, tick, focus);
   const onDetent = REG.some(r => Math.abs(r.L - uiL) < 0.07);
   const pipTop = `${clamp(railFrac(uiL), 0, 1) * 100}%`;
+
+  /** Descend into the selected star's system. */
+  const flyToSystem = (sy: System) => {
+    setFocus(sy);
+    pan.current = { x: 0, y: 0 };
+    setPanned(false);
+    setSel(null);
+    setTip(null);
+    // Frame the system by its own outermost orbit. A fixed rung would land at
+    // 1.9 AU, where Proxima's planets at 0.03 AU are sub-pixel.
+    const outer = Math.max(0.02, ...sy.planets.map(p => p.a ?? 0));
+    target.current = clamp(Math.log10(outer * 2.4 * AU), LMIN, LMAX);
+  };
+  const returnToSol = () => {
+    setFocus(null);
+    pan.current = { x: 0, y: 0 };
+    setPanned(false);
+    setSel(null);
+    setTip(null);
+    target.current = REG[4].L;
+  };
 
   const goToEncounter = () => {
     if (!detail?.jumpMs) return;
@@ -269,7 +373,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
   };
 
   return (
-    <div className="stage" ref={heroRef} style={{ cursor: 'grab' }}>
+    <div className="stage select-none" ref={heroRef} style={{ cursor: 'grab' }}>
       <canvas ref={cvRef} className="absolute inset-0 z-0 block h-full w-full" />
 
       {!bare && (
@@ -294,7 +398,28 @@ export default function Console({ initial }: { initial: Snapshot }) {
                 LOG₁₀ KM <b className="text-caution">{uiL.toFixed(2)}</b>
               </p>
               <p className="knock">
-                CENTRE <b className="text-caution">{anchorLabel(uiL)}</b>
+                CENTRE <b className="text-caution">{anchorLabel(uiL, focus)}</b>
+                {panned && <> · PANNED <b className="text-hazard">OFF AXIS</b></>}
+              </p>
+              <p className="knock">
+                VIEW <b className="text-caution">
+                  {camView.lat >= 0 ? '+' : ''}{camView.lat.toFixed(1)}°{' '}
+                  {(((camView.lon % 360) + 360) % 360).toFixed(1)}°
+                </b> · SHIFT-DRAG TO ORBIT
+              </p>
+              {focus && (
+                <p className="knock">
+                  FOCUSED <b className="text-caution">{focus.host.toUpperCase()}</b> ·{' '}
+                  <b className="text-live">{(focus.dist * 3.26156).toFixed(2)} LY</b> ·{' '}
+                  {focus.planets.length} PLANET(S)
+                </p>
+              )}
+              <p className="knock">
+                OBSERVER <b className={obs.live ? 'text-live' : 'text-chrome-dim'}>
+                  {obs.live
+                    ? `${Math.abs(obs.lat).toFixed(2)}${obs.lat >= 0 ? 'N' : 'S'} ${Math.abs(obs.lon).toFixed(2)}${obs.lon >= 0 ? 'E' : 'W'}`
+                    : 'DEFAULT · BLR'}
+                </b>
               </p>
             </div>
           </div>
@@ -354,21 +479,35 @@ export default function Console({ initial }: { initial: Snapshot }) {
                 top: clamp(tip.y - 10, 8, Math.max(8, size.current.h - 200)),
               }}
             >
-              <p className="mb-[5px] flex items-baseline gap-[6px] border-b border-dotted border-b-[color-mix(in_srgb,var(--color-chrome)_35%,transparent)] pb-1">
-                <b className="font-data text-[10.5px] text-caution">{detail.title}</b>
-                <button
-                  type="button"
-                  aria-label="Close"
-                  className="ml-auto cursor-pointer border-0 bg-transparent px-[2px] font-ui text-[11px] font-semibold text-chrome-dim hover:text-hazard"
-                  onClick={() => { setSel(null); setTip(null); }}
+              <div className="mb-[5px] border-b border-dotted border-b-[color-mix(in_srgb,var(--color-chrome)_35%,transparent)] pb-[5px]">
+                <p className="flex items-baseline gap-[6px]">
+                  <b className="font-data text-[10.5px] text-caution">{detail.title}</b>
+                  <button
+                    type="button"
+                    aria-label="Close"
+                    className="ml-auto cursor-pointer border-0 bg-transparent px-[2px] font-ui text-[11px] font-semibold text-chrome-dim hover:text-hazard"
+                    onClick={() => { setSel(null); setTip(null); }}
+                  >
+                    ✕
+                  </button>
+                </p>
+                <p
+                  className="mt-[2px] font-ui text-[9.5px] font-semibold uppercase tracking-[0.14em]"
+                  style={{ color: TONE_VAR[detail.tone] }}
                 >
-                  ✕
-                </button>
-              </p>
+                  {detail.kind}
+                </p>
+              </div>
               <Rows items={detail.rows.slice(0, 6)} />
               {detail.jumpMs && (
                 <button type="button" className="btn mt-[6px] w-full" onClick={goToEncounter}>
                   Go to encounter
+                </button>
+              )}
+              {sel?.kind === 'system' && data.sys[sel.i] && (
+                <button type="button" className="btn mt-[6px] w-full"
+                  onClick={() => flyToSystem(data.sys[sel.i])}>
+                  Fly to system
                 </button>
               )}
             </div>
@@ -382,10 +521,13 @@ export default function Console({ initial }: { initial: Snapshot }) {
             >
               <ObjectLog
                 dom={dom} data={data} sats={sats} sel={sel} simT={tick}
+                focus={focus}
                 mode={mode}
                 onSelect={s => { setSel(s); setTip(null); }}
                 onMode={setMode}
                 onClose={() => setShowLog(false)}
+                onFly={flyToSystem}
+                onReturn={returnToSol}
               />
             </div>
           )}
@@ -400,6 +542,16 @@ export default function Console({ initial }: { initial: Snapshot }) {
             </div>
           )}
 
+          {/* ── briefing: what this rung actually is ── */}
+          {showBrief && (
+            <div
+              className="absolute z-[4] w-[min(470px,42vw)]"
+              style={{ left: 214, bottom: showDocs ? 'calc(58vh + 60px)' : '60px' }}
+            >
+              <Brief dom={dom} focus={focus} />
+            </div>
+          )}
+
           {/* ── legend + affordances ── */}
           <div
             className="absolute left-0 right-0 z-[4] flex flex-wrap items-center gap-y-1 gap-x-[13px] px-3 py-[7px]"
@@ -410,7 +562,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
               Rung {dom + 1} of {N_REG} · blend {(alphaOf(dom, uiL) * 100).toFixed(0)}%
             </span>
             <span className="knock ml-auto font-ui text-[9.5px] font-medium uppercase tracking-[0.14em] text-chrome-dim">
-              Wheel · log zoom | Drag · orbit | 1–8 · jump | L R H · panels
+              Wheel · zoom | Drag · pan | Shift-drag · orbit | 1–8 · jump | B · brief | C · recentre | G · locate
             </span>
           </div>
         </>
@@ -438,12 +590,27 @@ export default function Console({ initial }: { initial: Snapshot }) {
         <button type="button" className="btn" aria-pressed={showLog} onClick={() => setShowLog(v => !v)}>
           Log
         </button>
+        <button type="button" className="btn" aria-pressed={showBrief} onClick={() => setShowBrief(v => !v)}>
+          Brief
+        </button>
         <button type="button" className="btn" aria-pressed={showDocs} onClick={() => setShowDocs(v => !v)}>
           Readouts
         </button>
         <button type="button" className="btn" aria-pressed={bare} onClick={() => setBare(v => !v)}>
           {bare ? 'Show chrome' : 'Clear view'}
         </button>
+        <span className="mx-1 h-[14px] w-px bg-[var(--hair)]" />
+        <button type="button" className="btn" onClick={locate}>
+          {obs.live ? 'Locate me' : 'Locate'}
+        </button>
+        <button type="button" className="btn" aria-pressed={panned} onClick={recentre}>
+          Recentre
+        </button>
+        {focus && (
+          <button type="button" className="btn" aria-pressed onClick={returnToSol}>
+            Return to Sol
+          </button>
+        )}
 
         <span className="t-label ml-auto hidden whitespace-nowrap lg:inline">Mission time</span>
         <span className="relative hidden h-px min-w-[30px] max-w-[240px] flex-1 bg-[color-mix(in_srgb,var(--color-chrome)_40%,transparent)] lg:block">

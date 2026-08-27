@@ -54,6 +54,19 @@ async function writeDisk(key: string, entry: { at: number; value: unknown }) {
   }
 }
 
+/**
+ * Cache-only read: no network, ever. Lets a caller apply everything it already
+ * knows for free before spending its request budget on what it does not.
+ */
+export async function recall<T>(key: string, ttlSec: number): Promise<T | null> {
+  const hot = mem.get(key);
+  if (hot) return hot.value as T;
+  const cold = await readDisk(key);
+  if (!cold) return null;
+  mem.set(key, cold);
+  return cold.value as T;
+}
+
 export async function remember<T>(key: string, ttlSec: number, load: () => Promise<T>): Promise<T> {
   const now = Date.now();
   const hot = mem.get(key);

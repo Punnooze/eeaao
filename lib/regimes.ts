@@ -41,9 +41,16 @@ export const DEC_PER_PX = 0.0038;
  */
 export function alphaOf(i: number, L: number) {
   const d = L - REG[i].L;
-  const gap = d > 0
-    ? (i > 0 ? REG[i - 1].L - REG[i].L : 0.6)
-    : (i < N_REG - 1 ? REG[i].L - REG[i + 1].L : 0.6);
+  // Sitting exactly on the detent is full weight, and must be handled before
+  // the branch below: at d === 0 the else-arm indexes REG[i + 1], which does
+  // not exist for the last rung.
+  if (d === 0) return 1;
+  // The first and last rungs have nothing to crossfade to on their outer side,
+  // so they hold full weight past their own detent. Without this, zooming in
+  // beyond the surface rung faded the planet toward black for no reason.
+  if (d > 0 && i === 0) return 1;
+  if (d < 0 && i === N_REG - 1) return 1;
+  const gap = d > 0 ? REG[i - 1].L - REG[i].L : REG[i].L - REG[i + 1].L;
   return clamp(1 - Math.abs(d) / gap, 0, 1);
 }
 

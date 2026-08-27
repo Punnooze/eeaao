@@ -60,6 +60,26 @@ export type Flight = {
   flight: string;
   type: string;
   gs: number;         // knots
+  hex: string;
+  /** Filled in from adsbdb once the callsign's route is known. */
+  orig?: string;      // IATA
+  dest?: string;
+  origCountry?: string;
+  destCountry?: string;
+  origLat?: number; origLon?: number;
+  destLat?: number; destLon?: number;
+  airline?: string;
+  /** true = route confirmed to cross a border. undefined = route unknown. */
+  intl?: boolean;
+};
+
+/** A real trans-neptunian object, so the outer belt is clickable. */
+export type Tno = {
+  name: string;
+  a: number; e: number; i: number; om: number; w: number; ma: number;
+  epoch: number;      // JD
+  h: number;
+  cls: string;
 };
 
 export type SatTotals = Record<SatGroup, number>;
@@ -79,6 +99,38 @@ export type Snapshot = {
   eqTitle: string;
   fl: Flight[];
   flTotal: number;
+  /** How many of the plotted aircraft have a confirmed cross-border route. */
+  flIntl: number;
+  /** Aircraft seen across all sampled corridors, before the cruise filter. */
+  flSeen: number;
+  flHubs: number;
+  tno: Tno[];
+  sys: System[];
   /** Which feeds came back stale or failed, so the UI can say so. */
   degraded: string[];
+};
+
+/** A confirmed planet, as published. Absent fields are genuinely unknown. */
+export type Exoplanet = {
+  name: string;
+  a: number | null;        // semi-major axis, AU
+  period: number | null;   // days
+  rade: number | null;     // Earth radii
+  masse: number | null;    // Earth masses
+  eqt: number | null;      // equilibrium temperature, K
+  method: string;
+  year: number | null;
+};
+
+/** A star with known planets, positioned from its own catalogue coordinates. */
+export type System = {
+  host: string;
+  dist: number;            // parsecs
+  ra: number; dec: number;
+  x: number; y: number; z: number;   // equatorial cartesian, parsecs
+  spect: string;
+  teff: number | null;
+  srad: number | null;     // solar radii
+  smass: number | null;
+  planets: Exoplanet[];
 };

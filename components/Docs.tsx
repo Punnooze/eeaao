@@ -1,4 +1,4 @@
-import { AU, BOUNDS, diamM, isoZ, LD, PLANETS, tMinus, type SatState } from '@/lib/astro';
+import { AU, BOUNDS, diamM, isoZ, LD, PLANETS, planElements, tMinus, type SatState } from '@/lib/astro';
 import { STARS } from '@/lib/stars';
 import type { Snapshot } from '@/lib/types';
 import {
@@ -28,7 +28,7 @@ function Provenance({ data }: { data: Snapshot }) {
         <b className="text-live">PROPAGATED</b> FROM PUBLISHED EPOCHS, SO SATELLITES AND ASTEROIDS
         ARE WHERE THEY ARE NOW, NOT WHERE THEY WERE FETCHED. SPACE-WEATHER, SEISMIC AND TRAFFIC
         READINGS ARE POINT-IN-TIME. SATELLITES USE MEAN ELEMENTS PLUS J2 NODAL DRIFT, NOT FULL
-        SGP4. PLANETS USE CIRCULAR MEAN ELEMENTS. THE GALACTIC AND OORT REGIMES ARE MODELS.
+        SGP4. PLANETS USE JPL&rsquo;S APPROXIMATE KEPLERIAN ELEMENTS. THE GALACTIC AND OORT REGIMES ARE MODELS.
       </Note>
       {data.degraded.length > 0 && (
         <p className="mt-2 font-data text-[9.5px] leading-relaxed text-hazard">
@@ -185,12 +185,16 @@ export default function Docs({
       <div className="docs">
         <Panel tab="Outer Planets">
           <Rows
-            items={PLANETS.slice(4).map(p => [
-              p.n,
-              `${p.a.toFixed(3)} AU · ${(360 / p.dL / 365.25).toFixed(1)} YR`,
-            ] as Row)}
+            items={PLANETS.slice(4).map(p => {
+              const el = planElements(p, simT);
+              return [p.n, `${el.a.toFixed(3)} AU · e ${el.e.toFixed(3)} · ${el.periodYr.toFixed(1)} YR`] as Row;
+            })}
           />
-          <Note>CIRCULAR MEAN ELEMENTS AT J2000 · ACCURATE TO ABOUT A DEGREE.</Note>
+          <Note>
+            JPL APPROXIMATE POSITIONS OF THE PLANETS &mdash; KEPLERIAN ELEMENTS AT J2000 WITH
+            PER-CENTURY RATES, GOOD TO ARCMINUTES ACROSS 1800&ndash;2050. ORBITS ARE DRAWN AS TRUE
+            ELLIPSES, SO ECCENTRICITY IS VISIBLE.
+          </Note>
         </Panel>
         <Panel tab="Heliosphere Boundary">
           <Rows
@@ -362,16 +366,25 @@ export default function Docs({
         />
         <Histo vals={mags} edges={[4.5, 5, 5.5, 6, 6.5, 8]} label="MAGNITUDE DISTRIBUTION" fmt={n => n.toFixed(1)} />
       </Panel>
-      <Panel tab="Air Traffic">
+      <Panel tab="International Traffic">
         <Rows
           items={[
-            ['Aircraft in view', `${data.flTotal} · 250 NM OF BLR`, 'series-a'],
+            ['Corridors sampled', `${data.flHubs} × 250 NM`, 'series-a'],
+            ['Aircraft seen', String(data.flSeen)],
+            ['At cruise', `${data.flTotal} · FL280+ · 350 KT+`],
+            ['Crossing confirmed', String(data.flIntl), 'hazard'],
             ['Plotted', String(data.fl.length)],
             ['Highest', `FL${String(Math.round(Math.max(0, ...data.fl.map(f => f.alt)) / 100)).padStart(3, '0')}`, 'series-a'],
-            ['On ground', String(data.fl.filter(f => f.alt === 0).length)],
             ['Fastest', `${Math.max(0, ...data.fl.map(f => f.gs))} KT`],
           ]}
         />
+        <Note>
+          NO FREE FEED CARRIES EVERY AIRCRAFT ON EARTH &mdash; OPENSKY&rsquo;S GLOBAL ENDPOINT IS
+          UNREACHABLE AND ADSB.LOL SERVES 250 NM CIRCLES ONLY. SO THIS SAMPLES {data.flHubs} MAJOR
+          CORRIDORS AND DEDUPLICATES BY ICAO HEX. &ldquo;CROSSING CONFIRMED&rdquo; MEANS ADSBDB
+          RESOLVED THE CALLSIGN AND THE TWO AIRPORT COUNTRIES DIFFER &mdash; NOT A GUESS FROM RANGE.
+          ROUTES RESOLVE PROGRESSIVELY AND CACHE FOR A WEEK.
+        </Note>
         <Histo
           vals={data.fl.map(f => f.alt / 100)}
           edges={[0, 100, 250, 350, 400, 450]}
