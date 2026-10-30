@@ -389,7 +389,9 @@ function starSphere(v: View, a: number) {
   if (a <= 0.01) return;
   const b = basis(v.camLat * 0.55 + SPACE_TILT, v.camLon + SPACE_SPIN);
   const R = Math.min(v.W, v.H) * 0.46;
-  const cx = v.W * 0.5, cy = v.H * 0.52;          // no pan: infinity does not shift
+  // Infinity should not shift with pan, but a fixed sky read as a broken drag;
+  // a slight parallax gives the gesture feedback without moving constellations much.
+  const cx = v.W * 0.5 + v.pan.x * R * 0.12, cy = v.H * 0.52 + v.pan.y * R * 0.12;
   const spread = R * 1.45;
   g.globalAlpha = a;
   for (const st of STARS) {

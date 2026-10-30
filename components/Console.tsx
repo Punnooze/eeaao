@@ -56,12 +56,15 @@ export default function Console({ initial }: { initial: Snapshot }) {
   const [showBrief, setShowBrief] = useState(true);
   const [bare, setBare] = useState(false);
   const [panned, setPanned] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
+  const [flashed, setFlashed] = useState(false);
   // Falls back to a fixed point until the visitor allows geolocation.
   const [obs, setObs] = useState({ lat: 12.97, lon: 77.59, label: 'BLR', live: false });
   /** A foreign star whose system replaces ours on the inner rungs. */
   const [focus, setFocus] = useState<System | null>(null);
 
   const heroRef = useRef<HTMLDivElement>(null);
+  const navRef = useRef<HTMLElement>(null);
   const cvRef = useRef<HTMLCanvasElement>(null);
   const L = useRef(REG[0].L);
   const target = useRef<number | null>(null);
@@ -94,6 +97,20 @@ export default function Console({ initial }: { initial: Snapshot }) {
   const reduced = useRef(false);
 
   LAND_REF.value = LAND;
+
+  /* ── per-viewport defaults + rung transitions ────────────────── */
+  useEffect(() => { if (matchMedia('(max-width: 1023px)').matches) setShowLog(false); }, []);
+
+  const prevDom = useRef(dom);
+  useEffect(() => {
+    if (prevDom.current !== dom) { prevDom.current = dom; setFlashed(true); }
+  }, [dom]);
+
+  // On the mobile strip, keep the current rung in view.
+  useEffect(() => {
+    if (!matchMedia('(max-width: 767px)').matches) return;
+    navRef.current?.querySelector('[aria-current=true]')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  }, [dom, bare]);
 
   /* ── canvas loop ─────────────────────────────────────────────── */
   useEffect(() => {
@@ -198,7 +215,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
   }, []);
 
   /* ── input ───────────────────────────────────────────────────── */
-  const jump = useCallback((i: number) => { target.current = REG[i].L; setTip(null); }, []);
+  const jump = useCallback((i: number) => { target.current = REG[i].L; setZoomed(true); setTip(null); }, []);
 
   const recentre = useCallback(() => {
     pan.current = { x: 0, y: 0 };
@@ -222,6 +239,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
 
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      setZoomed(true);
       const next = clamp(L.current + clamp(e.deltaY, -260, 260) * DEC_PER_PX, LMIN, LMAX);
       if (next === L.current) return;      // at an end stop
       target.current = null;
@@ -297,6 +315,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
     const tm = (e: TouchEvent) => {
       if (e.touches.length !== 2 || !pinch) return;
       const d = gap(e), th = angleOf(e);
+      setZoomed(true);
       target.current = null;
       L.current = clamp(L.current - Math.log10(d / pinch) * 1.4, LMIN, LMAX);
       cam.current.lon -= ((th - twist) * 180) / Math.PI;
@@ -311,6 +330,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
       if ((e.target as HTMLElement).matches?.('input,textarea')) return;
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
+        setZoomed(true);
         target.current = null;
         L.current = clamp(L.current + (e.key === 'ArrowDown' ? 0.25 : -0.25), LMIN, LMAX);
         setUiL(L.current);
@@ -380,32 +400,19 @@ export default function Console({ initial }: { initial: Snapshot }) {
         <>
           {/* ── header block: sits inside the view, never above it ── */}
           <div className="pointer-events-none absolute right-0 top-0 z-[3] flex flex-col items-end px-[14px] pt-4 text-right">
-            <span className="tab pointer-events-auto !left-auto !right-3 !top-2">{REG[dom].tab}</span>
-            <h1 className="t-display glow-display mt-6 max-w-[13ch]">
+            <span key={dom} className="tab anim-pop pointer-events-auto !left-auto !right-3 !top-2">{REG[dom].tab}</span>
+            <h1 className="t-display hdr-title glow-display anim-boot mt-6 max-w-[13ch]">
               Everything Everywhere All&nbsp;at&nbsp;Once
             </h1>
-            <p className="knock mt-[6px] font-ui text-[10.5px] font-medium uppercase tracking-[0.2em] text-chrome">
+            <p className="knock anim-rise mt-[6px] font-ui text-[10.5px] font-medium uppercase tracking-[0.2em] text-chrome max-md:hidden"
+              style={{ animationDelay: '120ms' }}>
               One descent · galaxy to ground · eight regimes
             </p>
             <div className="mt-[10px] flex flex-col items-end gap-[2px] font-data text-[10px] leading-snug text-chrome-dim tabular-nums">
-              <p className="knock">SRC · NOAA SWPC · JPL SSD/CNEOS · CELESTRAK · USGS · ADSB.LOL · HYG</p>
-              <p className="knock">{counts(dom, data)}</p>
-              <p className="knock">
-                SIM <b className="text-live">{isoZ(tick)}</b> · ×{rate}{held ? ' · HELD' : ''}
-              </p>
-              <p className="knock">
+              <p className="knock anim-rise" style={{ animationDelay: '200ms' }}>{counts(dom, data)}</p>
+              <p className="knock anim-rise max-md:hidden" style={{ animationDelay: '280ms' }}>
                 VIEW HALF-WIDTH <b className="text-live">{fmtScale(hw)}</b> ·{' '}
                 LOG₁₀ KM <b className="text-caution">{uiL.toFixed(2)}</b>
-              </p>
-              <p className="knock">
-                CENTRE <b className="text-caution">{anchorLabel(uiL, focus)}</b>
-                {panned && <> · PANNED <b className="text-hazard">OFF AXIS</b></>}
-              </p>
-              <p className="knock">
-                VIEW <b className="text-caution">
-                  {camView.lat >= 0 ? '+' : ''}{camView.lat.toFixed(1)}°{' '}
-                  {(((camView.lon % 360) + 360) % 360).toFixed(1)}°
-                </b> · SHIFT-DRAG TO ORBIT
               </p>
               {focus && (
                 <p className="knock">
@@ -414,25 +421,68 @@ export default function Console({ initial }: { initial: Snapshot }) {
                   {focus.planets.length} PLANET(S)
                 </p>
               )}
-              <p className="knock">
-                OBSERVER <b className={obs.live ? 'text-live' : 'text-chrome-dim'}>
-                  {obs.live
-                    ? `${Math.abs(obs.lat).toFixed(2)}${obs.lat >= 0 ? 'N' : 'S'} ${Math.abs(obs.lon).toFixed(2)}${obs.lon >= 0 ? 'E' : 'W'}`
-                    : 'DEFAULT · BLR'}
-                </b>
-              </p>
+              <details className="telemetry mt-[2px]">
+                <summary className="btn pointer-events-auto ml-auto w-fit list-none">Telemetry ▸</summary>
+                <div className="mt-[6px] flex flex-col items-end gap-[2px]">
+                  <p className="knock">SRC · NOAA SWPC · JPL SSD/CNEOS · CELESTRAK · USGS · ADSB.LOL · HYG</p>
+                  <p className="knock">
+                    SIM <b className="text-live">{isoZ(tick)}</b> · ×{rate}{held ? ' · HELD' : ''}
+                  </p>
+                  <p className="knock">
+                    CENTRE <b className="text-caution">{anchorLabel(uiL, focus)}</b>
+                    {panned && <> · PANNED <b className="text-hazard">OFF AXIS</b></>}
+                  </p>
+                  <p className="knock">
+                    VIEW <b className="text-caution">
+                      {camView.lat >= 0 ? '+' : ''}{camView.lat.toFixed(1)}°{' '}
+                      {(((camView.lon % 360) + 360) % 360).toFixed(1)}°
+                    </b> · SHIFT-DRAG TO ORBIT
+                  </p>
+                  <p className="knock">
+                    OBSERVER <b className={obs.live ? 'text-live' : 'text-chrome-dim'}>
+                      {obs.live
+                        ? `${Math.abs(obs.lat).toFixed(2)}${obs.lat >= 0 ? 'N' : 'S'} ${Math.abs(obs.lon).toFixed(2)}${obs.lon >= 0 ? 'E' : 'W'}`
+                        : 'DEFAULT · BLR'}
+                    </b>
+                  </p>
+                </div>
+              </details>
             </div>
           </div>
 
+          {/* ── regime change banner: translate on the wrapper, animation inside ── */}
+          {flashed && (
+            <div key={dom} className="pointer-events-none absolute left-1/2 top-[38%] z-[3] -translate-x-1/2 text-center">
+              <div className="regime-flash">
+                <p className="t-display glow-display" style={{ color: 'var(--color-chrome)', fontSize: 'clamp(1.4rem, 4vw, 3rem)' }}>
+                  {REG[dom].tab}
+                </p>
+                <p className="t-data knock mt-1">{fmtScale(REG[dom].hw)}</p>
+              </div>
+            </div>
+          )}
+
+          {/* ── scroll cue: until the first zoom ── */}
+          {!zoomed && (
+            <div className="pointer-events-none absolute left-1/2 top-[44%] z-[4] -translate-x-1/2">
+              <span className="bob knock font-ui text-[10.5px] font-semibold uppercase tracking-[0.18em] text-live">
+                <span className="max-md:hidden">Scroll to descend ↓</span>
+                <span className="md:hidden">Pinch to descend</span>
+              </span>
+            </div>
+          )}
+
           {/* ── log ladder: rung position ∝ log10 distance ── */}
           <nav
+            ref={navRef}
             data-ladder
             aria-label="Scale ladder"
-            className="absolute left-3 top-1/2 z-[5] h-[min(72vh,620px)] w-[196px] -translate-y-1/2"
+            className="ladder anim-rise z-[5]"
+            style={{ animationDelay: '200ms' }}
           >
             <span
               aria-hidden="true"
-              className="absolute bottom-0 top-0 w-px"
+              className="ladder-rail absolute bottom-0 top-0 w-px"
               style={{
                 left: 'calc(82px + 11px)',
                 background: 'linear-gradient(180deg, color-mix(in srgb, var(--color-chrome) 12%, transparent),'
@@ -456,13 +506,13 @@ export default function Console({ initial }: { initial: Snapshot }) {
             ))}
             <span
               aria-hidden="true"
-              className="absolute h-px w-[15px] -translate-x-1/2 -translate-y-1/2 bg-live"
+              className="ladder-rail absolute h-px w-[15px] -translate-x-1/2 -translate-y-1/2 bg-live"
               style={{ left: 'calc(82px + 11px)', top: pipTop, boxShadow: '0 0 7px var(--color-live)' }}
             />
             {!onDetent && (
               <span
                 aria-hidden="true"
-                className="absolute -translate-y-1/2 whitespace-nowrap font-data text-[9px] text-live"
+                className="ladder-rail absolute -translate-y-1/2 whitespace-nowrap font-data text-[9px] text-live"
                 style={{ left: 'calc(82px + 24px)', top: pipTop }}
               >
                 {fmtScale(hw)}
@@ -473,7 +523,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
           {/* ── click callout ── */}
           {tip && detail && (
             <div
-              className="overlay absolute z-[7] max-w-[216px] px-2 pb-[6px] pt-[7px]"
+              className="overlay anim-pop absolute z-[7] max-w-[216px] px-2 pb-[6px] pt-[7px]"
               style={{
                 left: clamp(tip.x + 14, 8, Math.max(8, size.current.w - 232)),
                 top: clamp(tip.y - 10, 8, Math.max(8, size.current.h - 200)),
@@ -516,7 +566,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
           {/* ── object log: floats, collapses to nothing ── */}
           {showLog && (
             <div
-              className="overlay absolute right-2 z-[6] flex w-[min(330px,42vw)] flex-col"
+              className="overlay anim-sheet log-sheet absolute right-2 z-[6] flex w-[min(330px,42vw)] flex-col"
               style={{ top: 'calc(58% - 8px)', bottom: showDocs ? 'calc(58vh + 46px)' : '76px' }}
             >
               <ObjectLog
@@ -535,7 +585,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
           {/* ── readouts drawer ── */}
           {showDocs && (
             <div
-              className="absolute bottom-[38px] left-0 right-0 z-[8] h-[58vh] overflow-y-auto border-t"
+              className="drawer anim-sheet absolute bottom-[38px] left-0 right-0 z-[8] h-[58vh] overflow-y-auto border-t"
               style={{ borderTopColor: 'var(--hair)', background: 'rgba(5,6,10,0.94)' }}
             >
               <Docs dom={dom} data={data} sats={sats} simT={tick} />
@@ -545,8 +595,8 @@ export default function Console({ initial }: { initial: Snapshot }) {
           {/* ── briefing: what this rung actually is ── */}
           {showBrief && (
             <div
-              className="absolute z-[4] w-[min(470px,42vw)]"
-              style={{ left: 214, bottom: showDocs ? 'calc(58vh + 60px)' : '60px' }}
+              className="brief-wrap absolute z-[4]"
+              style={showDocs ? { bottom: 'calc(58vh + 60px)' } : undefined}
             >
               <Brief dom={dom} focus={focus} />
             </div>
@@ -554,23 +604,26 @@ export default function Console({ initial }: { initial: Snapshot }) {
 
           {/* ── legend + affordances ── */}
           <div
-            className="absolute left-0 right-0 z-[4] flex flex-wrap items-center gap-y-1 gap-x-[13px] px-3 py-[7px]"
+            className="hint-bar absolute left-0 right-0 z-[4] flex flex-wrap items-center gap-y-1 gap-x-[13px] px-3 py-[7px]"
             style={{ bottom: showDocs ? 'calc(58vh + 38px)' : '38px' }}
           >
-            <span className="t-label knock">{REG[dom].tag}</span>
-            <span className="knock font-ui text-[9.5px] font-semibold uppercase tracking-[0.13em] text-chrome-dim">
+            <span className="t-label knock max-md:hidden">{REG[dom].tag}</span>
+            <span className="knock font-ui text-[9.5px] font-semibold uppercase tracking-[0.13em] text-chrome-dim max-md:hidden">
               Rung {dom + 1} of {N_REG} · blend {(alphaOf(dom, uiL) * 100).toFixed(0)}%
             </span>
-            <span className="knock ml-auto font-ui text-[9.5px] font-medium uppercase tracking-[0.14em] text-chrome-dim">
+            <span className="fade-hint knock ml-auto hidden font-ui text-[9.5px] font-medium uppercase tracking-[0.14em] text-chrome-dim lg:inline">
               Wheel · zoom | Drag · pan | Shift-drag · orbit | 1–8 · jump | B · brief | C · recentre | G · locate
+            </span>
+            <span className="knock font-ui text-[9.5px] font-medium uppercase tracking-[0.14em] text-chrome-dim md:hidden">
+              Pinch · zoom &nbsp; Drag · pan &nbsp; Tap · inspect
             </span>
           </div>
         </>
       )}
 
       {/* ── mission rail ── */}
-      <footer className="absolute bottom-0 left-0 right-0 z-[9] flex items-center gap-[9px] border-t bg-void px-3 py-[6px]"
-        style={{ borderTopColor: 'var(--hair)' }}>
+      <footer className="anim-rise absolute bottom-0 left-0 right-0 z-[9] flex items-center gap-[9px] overflow-x-auto border-t bg-void px-3 py-[6px]"
+        style={{ borderTopColor: 'var(--hair)', scrollbarWidth: 'none', animationDelay: '360ms' }}>
         <button type="button" className="btn" aria-pressed={held} onClick={() => setHeld(h => !h)}>
           {held ? '▶ Resume' : '⏸ Hold'}
         </button>
@@ -586,7 +639,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
           Now
         </button>
 
-        <span className="mx-1 h-[14px] w-px bg-[var(--hair)]" />
+        <span className="mx-1 h-[14px] w-px shrink-0 bg-[var(--hair)]" />
         <button type="button" className="btn" aria-pressed={showLog} onClick={() => setShowLog(v => !v)}>
           Log
         </button>
@@ -599,7 +652,7 @@ export default function Console({ initial }: { initial: Snapshot }) {
         <button type="button" className="btn" aria-pressed={bare} onClick={() => setBare(v => !v)}>
           {bare ? 'Show chrome' : 'Clear view'}
         </button>
-        <span className="mx-1 h-[14px] w-px bg-[var(--hair)]" />
+        <span className="mx-1 h-[14px] w-px shrink-0 bg-[var(--hair)]" />
         <button type="button" className="btn" onClick={locate}>
           {obs.live ? 'Locate me' : 'Locate'}
         </button>
@@ -619,8 +672,9 @@ export default function Console({ initial }: { initial: Snapshot }) {
             style={{ left: `calc(${(((tick % 86400000) / 86400000) * 100).toFixed(2)}% - 4px)` }}
           />
         </span>
+        {!held && <span className="live-dot hidden shrink-0 sm:block" />}
         <span
-          className="whitespace-nowrap font-data text-[11px] tabular-nums"
+          className="hidden whitespace-nowrap font-data text-[11px] tabular-nums sm:inline"
           style={{ color: held ? 'var(--color-caution)' : 'var(--color-live)' }}
         >
           {isoZ(tick)}
